@@ -11,6 +11,36 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CHAT_DIR = os.path.join(BASE_DIR, "chats")
 MEMORY_FILE = os.path.join(BASE_DIR, "memory.json")
 ALLOWED_MEMORY_KEYS = {"name", "preferred_language", "likes"}
+INVALID_NAME_VALUES = {"you", "me", "i", "my", "myself", "we", "us", "them", "he", "she", "it", "they", "them"}
+INVALID_GENERIC_VALUES = {"you", "me", "i", "we", "us", "they", "them"}
+KNOWN_LANGUAGES = {
+    "english",
+    "chinese",
+    "mandarin",
+    "spanish",
+    "french",
+    "german",
+    "italian",
+    "japanese",
+    "korean",
+    "russian",
+    "arabic",
+    "portuguese",
+    "hindi",
+    "bengali",
+    "urdu",
+    "punjabi",
+    "dutch",
+    "swedish",
+    "norwegian",
+    "danish",
+    "finnish",
+    "polish",
+    "greek",
+    "thai",
+    "vietnamese",
+    "turkish",
+}
 
 
 def now_string():
@@ -162,6 +192,62 @@ def safe_parse_json(text_value):
     return {}
 
 
+def extract_language_from_message(message):
+    if not isinstance(message, str):
+        return ""
+
+    msg = message.lower()
+    msg = msg.replace("!", " ").replace("?", " ").replace(".", " ").replace(",", " ").replace(";", " ")
+    phrases = [
+        "my preferred language is",
+        "my preferred language",
+        "preferred language is",
+        "i prefer ",
+        "i'd prefer ",
+        "prefer to speak",
+        "please speak",
+        "speak ",
+    ]
+
+    for phrase in phrases:
+        pos = msg.find(phrase)
+        if pos == -1:
+            continue
+
+        rest = msg[pos + len(phrase):].strip()
+        for _ in range(2):
+            if rest.startswith("the "):
+                rest = rest[4:]
+            if rest.startswith("my "):
+                rest = rest[3:]
+
+        if not rest:
+            continue
+
+        rest = rest.split(" and ")[0]
+        rest = rest.split(" or ")[0]
+        rest = rest.split(" with ")[0]
+        rest = rest.split(" for ")[0]
+        rest = rest.split(" now")[0]
+        rest = rest.split(" please")[0]
+        rest = rest.strip(" :")
+        if not rest:
+            continue
+
+        if " " in rest:
+            candidate = " ".join(rest.split()[:2])
+        else:
+            candidate = rest
+
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+
+        return candidate.title()
+
+    return ""
+
+
 def sanitize_memory(raw_memory):
     if not isinstance(raw_memory, dict):
         return {}
@@ -194,6 +280,107 @@ def sanitize_memory(raw_memory):
     return cleaned
 
 
+def filter_explicit_memory(raw_memory, user_message):
+    if not isinstance(raw_memory, dict) or not isinstance(user_message, str):
+        return {}
+
+    msg = user_message.strip().lower()
+    explicit = {}
+    like_trigger = [" i like ", " i love ", " i enjoy ", " i prefer ", " i am into ", " i'm into "]
+    lang_trigger = [
+        " language is",
+        " language",
+        " i prefer",
+        " i'd prefer",
+        " prefer ",
+        " please speak",
+        " speak",
+        " speaking",
+        " can you speak",
+        " i speak",
+        " i can speak",
+        " can you say",
+    ]
+    name_trigger = [
+        "my name is",
+        "name is",
+        "call me",
+        "it's",
+        "i am",
+        "i'm",
+        "this is",
+    ]
+    has_name_trigger = any(trigger in msg for trigger in name_trigger)
+    has_lang_trigger = any(trigger in msg for trigger in lang_trigger)
+    has_like_trigger = any(trigger in msg for trigger in like_trigger)
+
+    for key, value in raw_memory.items():
+        if key == "likes":
+            if isinstance(value, list):
+                likes = []
+                for item in value:
+                    if not isinstance(item, str):
+                        continue
+                    item_clean = item.strip()
+                    if not item_clean:
+                        continue
+                    item_low = item_clean.lower()
+                    if item_low in INVALID_GENERIC_VALUES:
+                        continue
+                    if has_like_trigger and item_low in msg:
+                        likes.append(item_clean)
+                if likes:
+                    explicit[key] = likes
+            continue
+
+        if key in ("name", "preferred_language") and isinstance(value, str):
+            value_clean = value.strip()
+            value_low = value_clean.lower()
+            if not value_clean or len(value_clean) < 2:
+                continue
+
+            if value_low in INVALID_NAME_VALUES or value_low in INVALID_GENERIC_VALUES:
+                continue
+
+            if key == "name":
+                if not has_name_trigger:
+                    continue
+            if key == "preferred_language":
+                language_value = value_clean
+                if not has_lang_trigger:
+                    language_value = extract_language_from_message(user_message)
+
+                if not language_value:
+                    continue
+
+                language_value = language_value.strip()
+                if not language_value:
+                    continue
+
+                language_low = language_value.lower()
+                if language_low not in KNOWN_LANGUAGES:
+                    first_word = language_low.split(" ")[0]
+                    if first_word in KNOWN_LANGUAGES:
+                        language_value = first_word.title()
+                        language_low = first_word
+                    else:
+                        if not has_lang_trigger:
+                            continue
+                        if language_low not in KNOWN_LANGUAGES:
+                            # Keep strong quality bar for ambiguous extractions
+                            continue
+
+                if language_low not in KNOWN_LANGUAGES:
+                    # Keep strict memory quality
+                    continue
+
+                explicit[key] = language_value
+            elif value_low in msg:
+                explicit[key] = value_clean
+
+    return explicit
+
+
 def merge_memory(existing, new):
     if not isinstance(existing, dict):
         existing = {}
@@ -210,6 +397,21 @@ def merge_memory(existing, new):
             continue
 
         old = merged[key]
+
+        if key in ("name", "preferred_language"):
+            if isinstance(old, str) and isinstance(value, str):
+                old_clean = old.strip().lower()
+                new_clean = value.strip().lower()
+                if old_clean == new_clean:
+                    merged[key] = old
+                elif old_clean and len(new_clean) >= 2 and new_clean not in INVALID_NAME_VALUES:
+                    merged[key] = value
+                else:
+                    merged[key] = old
+                continue
+            if isinstance(old, str) and not isinstance(value, str):
+                merged[key] = old
+                continue
 
         if isinstance(old, list) and isinstance(value, list):
             merged_list = list(old)
@@ -312,7 +514,7 @@ def extract_user_memory(token, user_message):
 
     choices = data.get("choices") if isinstance(data, dict) else None
     if not isinstance(choices, list) or not choices:
-        return simple_memory_fallback(user_message)
+        return {}
 
     first = choices[0]
     if not isinstance(first, dict):
@@ -328,6 +530,12 @@ def extract_user_memory(token, user_message):
         return {}
 
     parsed = sanitize_memory(parsed)
+    if "preferred_language" not in parsed:
+        recovered_language = extract_language_from_message(user_message)
+        if recovered_language:
+            parsed["preferred_language"] = recovered_language
+
+    parsed = filter_explicit_memory(parsed, user_message)
     return parsed
 
 
@@ -612,5 +820,3 @@ if isinstance(assistant_reply, str) and assistant_reply.strip():
         st.session_state.memory = new_memory
         if save_memory(st.session_state.memory):
             st.rerun()
-    else:
-        save_memory(st.session_state.memory)
